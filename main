@@ -1,0 +1,134 @@
+# main.py
+import os, time, requests, math
+from datetime import datetime
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID  = os.environ.get("CHAT_ID")
+INTERVAL = int(os.environ.get("INTERVAL_SECONDS", "900"))  # default 900s = 15min
+SWING_LOOKBACK = int(os.environ.get("SWING_LOOKBACK", "6"))  # number of samples to compute swing
+
+if not BOT_TOKEN or not CHAT_ID:
+    raise SystemExit("Missing BOT_TOKEN or CHAT_ID environment variables")
+
+def send_telegram(pair, direction, entry, sl, tp1, tp2, confidence):
+    text = (
+        f"💰 IJAT SIGNAL\n"
+        f"Pair: {pair}\n"
+        f"Type: {direction}\n"
+        f"Entry: {entry}\n"
+        f"SL: {sl}\n"
+        f"TP1: {tp1} | TP2: {tp2}\n"
+        f"RR: 1:2\n"
+        f"Confidence: {confidence}%\n"
+        f"Timeframe: 15m\n"
+        f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    )
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": text})
+        return r.status_code == 200
+    except Exception as e:
+        print("Send error:", e)
+        return False
+
+def fetch_xau_price():
+    # metals.live public endpoint returns array [{price:...},...]
+    try:
+        r = requests.get("https://api.metals.live/v1/spot/gold", timeout=10)
+        arr = r.json()
+        if isinstance(arr, list) and len(arr)>0 and "price" in arr[0]:
+            return float(arr[0]["price"])
+    except Exception as e:
+        print("XAU fetch error:", e)
+    return None
+
+def fetch_btc_price():
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=10)
+        j = r.json()
+        return float(j["bitcoin"]["usd"])
+    except Exception as e:
+        print("BTC fetch error:", e)
+    return None
+
+# simple memory store local file to keep history between runs
+import json, pathlib
+STORE = pathlib.Path("price_store.json")
+if not STORE.exists():
+    STORE.write_text(json.dumps({"XAUUSD": [], "BTCUSD": []}))
+
+def load_store():
+    return json.loads(STORE.read_text())
+
+def save_store(s):
+    STORE.write_text(json.dumps(s))
+
+def push_price(pair, price):
+    s = load_store()
+    arr = s.get(pair, [])
+    arr.append({"t": int(time.time()), "p": price})
+    # keep max 48 samples
+    if len(arr) > 48:
+        arr = arr[-48:]
+    s[pair] = arr
+    save_store(s)
+
+def recent_prices(pair, n=6):
+    s = load_store()
+    arr = s.get(pair, [])
+    return [x["p"] for x in arr[-n:]]
+
+def avg(xs):
+    return sum(xs)/len(xs) if xs else None
+
+def simple_signal_logic(pair):
+    prices = recent_prices(pair, SWING_LOOKBACK)
+    if len(prices) < 3:
+        return None
+    cur = prices[-1]
+    high = max(prices)
+    low  = min(prices)
+    rng  = high - low if high>low else 1.0
+    fib382 = low + rng*0.382
+    fib618 = low + rng*0.618
+    # momentum: compare last price to 3-sample SMA
+    sma3 = avg(prices[-3:])
+    # condition: if price near fib382 and price > sma3 => BUY
+    tol = rng * 0.03  # 3% tolerance of range
+    if abs(cur - fib382) <= tol and cur > sma3:
+        entry = round(cur,2)
+        sl = round(low,2)
+        tp1 = round(entry + (entry - sl),2)
+        tp2 = round(entry + 2*(entry - sl),2)
+        return ("BUY", entry, sl, tp1, tp2, 80)
+    # if price near fib618 and cur < sma3 => SELL
+    if abs(cur - fib618) <= tol and cur < sma3:
+        entry = round(cur,2)
+        sl = round(high,2)
+        tp1 = round(entry - (sl - entry),2)
+        tp2 = round(entry - 2*(sl - entry),2)
+        return ("SELL", entry, sl, tp1, tp2, 78)
+    return None
+
+def run_once():
+    xau = fetch_xau_price()
+    btc = fetch_btc_price()
+    if xau:
+        push_price("XAUUSD", xau)
+    if btc:
+        push_price("BTCUSD", btc)
+    # evaluate signals
+    for pair in ["XAUUSD","BTCUSD"]:
+        sig = simple_signal_logic(pair)
+        if sig:
+            direction, entry, sl, tp1, tp2, conf = sig
+            ok = send_telegram(pair, direction, entry, sl, tp1, tp2, conf)
+            print("Sent:", pair, sig, "ok=", ok)
+
+if __name__ == "__main__":
+    while True:
+        try:
+            run_once()
+        except Exception as e:
+            print("Main loop error:", e)
+        time.sleep(INTERVAL)
